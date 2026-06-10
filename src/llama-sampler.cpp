@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-grammar.h"
+#include "llama-quantum-rng.h"
 
 #include "ggml-cpp.h"
 
@@ -16,8 +17,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <fstream>
-#include <mutex>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -215,80 +214,6 @@ static void llama_token_data_array_partial_sort_inplace(llama_token_data_array *
 
     cur_p->size = npartial;
     cur_p->sorted = true;
-}
-
-// Quantum random stream override:
-// consumes values sequentially from the Qiskit export and, when the stream ends,
-// loops back to the first value. Values are expected in [0, 1), separated by
-// commas, whitespace, or both. Any finite value outside the interval is folded
-// into [0, 1) with fmod so the sampler always receives a valid uniform value.
-static double llama_quantum_random_01() {
-    static const char * path = "C:\\Scripts\\qiskit\\full_export\\random_numbers_1920x1440.txt";
-
-    static std::mutex mutex;
-    static std::vector<double> values;
-    static size_t index = 0;
-    static size_t total_consumed = 0;
-    static bool loaded = false;
-
-    std::lock_guard<std::mutex> lock(mutex);
-
-    if (!loaded) {
-        std::ifstream file(path);
-        if (!file) {
-            throw std::runtime_error(std::string("failed to open quantum random file: ") + path);
-        }
-
-        while (!file.eof()) {
-            double value;
-            if (file >> value) {
-                if (std::isfinite(value)) {
-                    value = std::fmod(value, 1.0);
-                    if (value < 0.0) {
-                        value += 1.0;
-                    }
-                    if (value >= 1.0) {
-                        value = std::nextafter(1.0, 0.0);
-                    }
-                    values.push_back(value);
-                }
-            } else {
-                file.clear();
-                char ignored;
-                file.get(ignored);
-            }
-        }
-
-        if (values.empty()) {
-            throw std::runtime_error(std::string("quantum random file has no usable numbers: ") + path);
-        }
-
-        loaded = true;
-
-        if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
-            fprintf(stderr, "[quantum-rng] loaded %zu values from %s\n", values.size(), path);
-        }
-    }
-
-    const size_t index_before = index;
-    const double result = values[index++];
-    if (index >= values.size()) {
-        index = 0;
-    }
-
-    ++total_consumed;
-
-    if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
-        const bool log_all = std::getenv("LLAMA_QUANTUM_RNG_LOG_ALL") != nullptr;
-        if (log_all || total_consumed <= 64 || index == 0) {
-            fprintf(stderr,
-                    "[quantum-rng] consumed=%zu index=%zu value=%.17g next_index=%zu%s\n",
-                    total_consumed, index_before, result, index,
-                    index == 0 ? " wrapped_to_start" : "");
-        }
-    }
-
-    return result;
 }
 
 static int llama_sample_dist(llama_token_data_array * cur_p, std::mt19937 & rng) {

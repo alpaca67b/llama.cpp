@@ -4,10 +4,13 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-quantum-rng.h"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -15,6 +18,15 @@
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
+}
+
+static float llama_quantum_attention_strength() {
+    const char * env = std::getenv("LLAMA_QUANTUM_ATTN_STRENGTH");
+    if (!env) {
+        return 1.0f;
+    }
+
+    return std::max(0.0f, (float) std::atof(env));
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -1450,25 +1462,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const int64_t n_kv     = args.n_kv;
     const int64_t n_stream = args.n_stream;
     const int64_t n_tps    = args.n_tps;
+    const float   quantum_attn_strength = llama_quantum_attention_strength();
+    const bool    quantum_attn_enabled  = quantum_attn_strength > 0.0f;
+    const bool    quantum_log_enabled   = quantum_attn_enabled && std::getenv("LLAMA_QUANTUM_RNG_LOG") != nullptr;
+    const bool    quantum_log_all       = quantum_log_enabled && std::getenv("LLAMA_QUANTUM_RNG_LOG_ALL") != nullptr;
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
 
-    // the min position in the batch for each sequence
-    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
-    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
-
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        const llama_seq_id seq_id = ubatch->seq_id[i][0];
-
-        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
-    }
+    size_t quantum_rows_processed = 0;
+    size_t quantum_finite_total   = 0;
+    size_t quantum_masked_total   = 0;
+    size_t quantum_samples_logged = 0;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
-        std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
-        std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
-
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
 
@@ -1485,46 +1492,52 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const uint64_t idst = n_kv*i;
 
-            // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
-            // the only cells that could change are the ones that are with similar positions as the
-            //   ones in the batch (i.e. due to causal masking, SWA, etc.)
-            // keep track of those cells and shortcut the loop to save time
-            // note: this optimization is not compatible with Alibi position encoding
-            // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
+            uint32_t n_visible = 0;
 
-            auto & idxs = seq_idxs[seq_id];
+            for (uint32_t jj = 0; jj < n_kv; ++jj) {
+                const uint32_t j = jj;
 
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
+                if (cells.is_empty(j)) {
+                    continue;
                 }
+
+                if (!cells.seq_has(j, seq_id)) {
+                    continue;
+                }
+
+                p0 = cells.pos_get(j);
+
+                if (causal) {
+                    if (p0 > p1) {
+                        continue;
+                    }
+
+                    if (is_2d) {
+                        if (p0 == p1) {
+                            const auto & p0_ext = cells.ext_get(j);
+
+                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if (swa) {
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                        continue;
+                    }
+                }
+
+                ++n_visible;
+            }
+
+            if (quantum_attn_enabled) {
+                ++quantum_rows_processed;
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                uint32_t j = jj;
-
-                // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
-
-                        j = idxs[jj];
-                    }
-                }
+                const uint32_t j = jj;
 
                 if (cells.is_empty(j)) {
                     goto skip;
@@ -1536,15 +1549,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 p0 = cells.pos_get(j);
-
-                if (!alibi) {
-                    if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
-                        }
-                    }
-                }
 
                 if (causal) {
                     // mask future tokens
@@ -1572,15 +1576,64 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    float mask_value = static_cast<float>(-std::abs(p0 - p1));
+                    if (quantum_attn_enabled && n_visible > 0) {
+                        const double txt_value = llama_quantum_random_at((size_t) p0);
+                        const float bias = std::log1p(quantum_attn_strength*(float) txt_value/(float) n_visible);
+                        mask_value += bias;
+                        ++quantum_finite_total;
+
+                        if (quantum_log_enabled && (quantum_log_all || quantum_rows_processed <= 16) && quantum_samples_logged < 8) {
+                            fprintf(stderr,
+                                    "[quantum-rng] pos-bias sample pos=%d txt=%.17g N=%u base=%.9g bias=%.9g value=%.9g\n",
+                                    (int) p0, txt_value, n_visible,
+                                    (double) (-std::abs(p0 - p1)), (double) bias, (double) mask_value);
+                            ++quantum_samples_logged;
+                        }
+                    }
+
+                    data[idst + j] = llama_cast<T>(mask_value);
                 } else {
-                    data[idst + j] = mask_keep;
+                    T mask_value = mask_keep;
+                    if (quantum_attn_enabled && n_visible > 0) {
+                        const double txt_value = llama_quantum_random_at((size_t) p0);
+                        const float bias = std::log1p(quantum_attn_strength*(float) txt_value/(float) n_visible);
+                        mask_value = llama_cast<T>(bias);
+                        ++quantum_finite_total;
+
+                        if (quantum_log_enabled && (quantum_log_all || quantum_rows_processed <= 16) && quantum_samples_logged < 8) {
+                            fprintf(stderr,
+                                    "[quantum-rng] pos-bias sample pos=%d txt=%.17g N=%u base=0 bias=%.9g value=%.9g\n",
+                                    (int) p0, txt_value, n_visible, (double) bias, (double) bias);
+                            ++quantum_samples_logged;
+                        }
+                    }
+
+                    data[idst + j] = mask_value;
                 }
 
                 continue;
 skip:
                 data[idst + j] = mask_drop;
+                if (quantum_attn_enabled) {
+                    ++quantum_masked_total;
+                }
             }
+        }
+    }
+
+    if (quantum_log_enabled) {
+        static size_t quantum_call_count = 0;
+        ++quantum_call_count;
+
+        if (quantum_log_all || quantum_call_count <= 64) {
+            fprintf(stderr,
+                    "[quantum-rng] attention pos-bias call=%zu alpha=%.9g wrap=on mode=context_position formula=log1p(alpha*txt[pos]/N) rows=%zu finite=%zu masked=%zu\n",
+                    quantum_call_count,
+                    (double) quantum_attn_strength,
+                    quantum_rows_processed,
+                    quantum_finite_total,
+                    quantum_masked_total);
         }
     }
 }
