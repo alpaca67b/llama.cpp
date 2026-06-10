@@ -12,9 +12,12 @@
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -214,36 +217,98 @@ static void llama_token_data_array_partial_sort_inplace(llama_token_data_array *
     cur_p->sorted = true;
 }
 
+// Quantum random stream override:
+// consumes values sequentially from the Qiskit export and, when the stream ends,
+// loops back to the first value. Values are expected in [0, 1), separated by
+// commas, whitespace, or both. Any finite value outside the interval is folded
+// into [0, 1) with fmod so the sampler always receives a valid uniform value.
+static double llama_quantum_random_01() {
+    static const char * path = "C:\\Scripts\\qiskit\\full_export\\random_numbers_1920x1440.txt";
+
+    static std::mutex mutex;
+    static std::vector<double> values;
+    static size_t index = 0;
+    static size_t total_consumed = 0;
+    static bool loaded = false;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (!loaded) {
+        std::ifstream file(path);
+        if (!file) {
+            throw std::runtime_error(std::string("failed to open quantum random file: ") + path);
+        }
+
+        while (!file.eof()) {
+            double value;
+            if (file >> value) {
+                if (std::isfinite(value)) {
+                    value = std::fmod(value, 1.0);
+                    if (value < 0.0) {
+                        value += 1.0;
+                    }
+                    if (value >= 1.0) {
+                        value = std::nextafter(1.0, 0.0);
+                    }
+                    values.push_back(value);
+                }
+            } else {
+                file.clear();
+                char ignored;
+                file.get(ignored);
+            }
+        }
+
+        if (values.empty()) {
+            throw std::runtime_error(std::string("quantum random file has no usable numbers: ") + path);
+        }
+
+        loaded = true;
+
+        if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
+            fprintf(stderr, "[quantum-rng] loaded %zu values from %s\n", values.size(), path);
+        }
+    }
+
+    const size_t index_before = index;
+    const double result = values[index++];
+    if (index >= values.size()) {
+        index = 0;
+    }
+
+    ++total_consumed;
+
+    if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
+        const bool log_all = std::getenv("LLAMA_QUANTUM_RNG_LOG_ALL") != nullptr;
+        if (log_all || total_consumed <= 64 || index == 0) {
+            fprintf(stderr,
+                    "[quantum-rng] consumed=%zu index=%zu value=%.17g next_index=%zu%s\n",
+                    total_consumed, index_before, result, index,
+                    index == 0 ? " wrapped_to_start" : "");
+        }
+    }
+
+    return result;
+}
+
 static int llama_sample_dist(llama_token_data_array * cur_p, std::mt19937 & rng) {
-    // iterator for the probabilities
-#ifdef __GNUC__
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wunused-local-typedefs"
-#endif
+    GGML_UNUSED(rng);
 
-    struct probs_iterator {
-        typedef std::input_iterator_tag iterator_category;
-        typedef float value_type;
-        typedef float * pointer;
-        typedef float & reference;
-        typedef ptrdiff_t difference_type;
+    double sum = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        sum += cur_p->data[i].p;
+    }
 
-        const llama_token_data * data;
+    const double target = sum*llama_quantum_random_01();
+    double cumulative = 0.0;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cumulative += cur_p->data[i].p;
+        if (cumulative >= target) {
+            return (int) i;
+        }
+    }
 
-        bool operator==(const probs_iterator & other) const { return data == other.data; }
-        bool operator!=(const probs_iterator & other) const { return data != other.data; }
-        const float & operator*() const { return data->p; }
-        probs_iterator & operator++() { ++data; return *this; }
-        probs_iterator operator++(int) { probs_iterator tmp = *this; ++data; return tmp; }
-    };
-
-#ifdef __GNUC__
-    #pragma GCC diagnostic pop
-#endif
-
-    std::discrete_distribution<int> dist(probs_iterator{cur_p->data}, probs_iterator{cur_p->data + cur_p->size});
-
-    return dist(rng);
+    return (int) cur_p->size - 1;
 }
 
 /*
@@ -1069,8 +1134,8 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // sample from the obtained probabilities and normalize the probs in a single pass
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const double rnd = dist(ctx->rng);
+    GGML_UNUSED(ctx);
+    const double rnd = llama_quantum_random_01();
 
           double sum_run = 0.0f;
     const double sum_tgt = sum_cum*rnd;
@@ -1203,13 +1268,8 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
 
     GGML_ASSERT(sctx->inp_uniform != nullptr);
 
-    // We sample in double precision and cast to float to match rnd numbers of
-    // llama_dampler_dist which uses double precision (sampling from
-    // std::uniform_real_distribution<double> and
-    // std::uniform_real_distribution<float> with same rng will produce
-    // different sequences).
-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const float rnd = dist(sctx->rng);
+    // Quantum stream value, consumed sequentially and looped when exhausted.
+    const float rnd = (float) llama_quantum_random_01();
 
     ggml_backend_tensor_set(sctx->inp_uniform, &rnd, 0, sizeof(float));
 }
@@ -2124,8 +2184,7 @@ static void llama_sample_xtc_apply(struct llama_sampler * smpl, llama_token_data
         return;
     }
 
-    std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
-    float chance = distribution(ctx->rng);
+    float chance = (float) llama_quantum_random_01();
     if (chance > ctx->probability) {
         return;
     }
