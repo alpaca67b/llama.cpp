@@ -86,6 +86,17 @@ int llama_server(int argc, char ** argv) {
         return 1;
     }
 
+#ifdef _WIN32
+    {
+        const char * qrng_port = llama_quantum_qrng_detect_port();
+        if (qrng_port != nullptr && qrng_port[0] != '\0') {
+            SRV_INF("QRNG detected on %s\n", qrng_port);
+        } else {
+            SRV_WRN("%s", "QRNG not detected on any COM port\n");
+        }
+    }
+#endif
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -323,7 +334,16 @@ int llama_server(int argc, char ** argv) {
     sigaction(SIGTERM, &sigint_action, NULL);
 #elif defined (_WIN32)
     auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
-        return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
+        switch (ctrl_type) {
+            case CTRL_C_EVENT:
+            case CTRL_BREAK_EVENT:
+            case CTRL_CLOSE_EVENT:
+            case CTRL_SHUTDOWN_EVENT:
+                signal_handler(SIGINT);
+                return true;
+            default:
+                return false;
+        }
     };
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif

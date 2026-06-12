@@ -449,6 +449,8 @@ extern "C" {
     // Call once at the start of the program
     LLAMA_API void llama_backend_init(void);
 
+    LLAMA_API const char * llama_quantum_qrng_detect_port(void);
+
     // Call once at the end of the program - currently only used for MPI
     LLAMA_API void llama_backend_free(void);
 

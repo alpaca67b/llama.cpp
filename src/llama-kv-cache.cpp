@@ -1536,6 +1536,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 ++quantum_rows_processed;
             }
 
+            bool quantum_have_row_seed = false;
+
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 const uint32_t j = jj;
 
@@ -1578,15 +1580,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (alibi) {
                     float mask_value = static_cast<float>(-std::abs(p0 - p1));
                     if (quantum_attn_enabled && n_visible > 0) {
-                        const double txt_value = llama_quantum_random_at((size_t) p0);
+                        const double txt_value = quantum_have_row_seed ? llama_quantum_random_next_01() : llama_quantum_random_01();
+                        const char * txt_value_text = llama_quantum_random_last_text();
                         const float bias = std::log1p(quantum_attn_strength*(float) txt_value/(float) n_visible);
                         mask_value += bias;
                         ++quantum_finite_total;
+                        quantum_have_row_seed = true;
 
                         if (quantum_log_enabled && (quantum_log_all || quantum_rows_processed <= 16) && quantum_samples_logged < 8) {
                             fprintf(stderr,
-                                    "[quantum-rng] pos-bias sample pos=%d txt=%.17g N=%u base=%.9g bias=%.9g value=%.9g\n",
-                                    (int) p0, txt_value, n_visible,
+                                    "[quantum-rng] pos-bias sample pos=%d txt=%s N=%u base=%.9g bias=%.9g value=%.9g\n",
+                                    (int) p0, txt_value_text != nullptr ? txt_value_text : "", n_visible,
                                     (double) (-std::abs(p0 - p1)), (double) bias, (double) mask_value);
                             ++quantum_samples_logged;
                         }
@@ -1596,15 +1600,17 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 } else {
                     T mask_value = mask_keep;
                     if (quantum_attn_enabled && n_visible > 0) {
-                        const double txt_value = llama_quantum_random_at((size_t) p0);
+                        const double txt_value = quantum_have_row_seed ? llama_quantum_random_next_01() : llama_quantum_random_01();
+                        const char * txt_value_text = llama_quantum_random_last_text();
                         const float bias = std::log1p(quantum_attn_strength*(float) txt_value/(float) n_visible);
                         mask_value = llama_cast<T>(bias);
                         ++quantum_finite_total;
+                        quantum_have_row_seed = true;
 
                         if (quantum_log_enabled && (quantum_log_all || quantum_rows_processed <= 16) && quantum_samples_logged < 8) {
                             fprintf(stderr,
-                                    "[quantum-rng] pos-bias sample pos=%d txt=%.17g N=%u base=0 bias=%.9g value=%.9g\n",
-                                    (int) p0, txt_value, n_visible, (double) bias, (double) bias);
+                                    "[quantum-rng] pos-bias sample pos=%d txt=%s N=%u base=0 bias=%.9g value=%.9g\n",
+                                    (int) p0, txt_value_text != nullptr ? txt_value_text : "", n_visible, (double) bias, (double) bias);
                             ++quantum_samples_logged;
                         }
                     }

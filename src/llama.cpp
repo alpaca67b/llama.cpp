@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-quantum-rng.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -114,6 +115,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 }
 
 void llama_backend_free(void) {
+    llama_quantum_qrng_shutdown();
     ggml_quantize_free();
 }
 
