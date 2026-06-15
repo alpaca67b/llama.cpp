@@ -40,10 +40,10 @@ struct llama_quantum_csv_state {
     std::mutex mutex;
     std::vector<double> values;
     std::vector<std::string> texts;
-    bool loaded = false;
+    std::atomic<bool> loaded = false;
 };
 
-thread_local std::string llama_quantum_random_last_text_storage;
+thread_local const char * llama_quantum_random_last_text_ptr = nullptr;
 thread_local size_t llama_quantum_random_last_index = 0;
 thread_local bool llama_quantum_random_last_index_valid = false;
 
@@ -134,7 +134,7 @@ llama_quantum_random_state & llama_quantum_random_get_state() {
 }
 
 void llama_quantum_random_load_locked(llama_quantum_csv_state & state) {
-    if (state.loaded) {
+    if (state.loaded.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -183,7 +183,7 @@ void llama_quantum_random_load_locked(llama_quantum_csv_state & state) {
         throw std::runtime_error(std::string("quantum random file has no usable numbers: ") + path);
     }
 
-    state.loaded = true;
+    state.loaded.store(true, std::memory_order_release);
 
     if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
         fprintf(stderr, "[quantum-rng] loaded %zu values from %s\n", state.values.size(), path);
@@ -421,24 +421,30 @@ extern "C" LLAMA_API const char * llama_quantum_qrng_detect_port() {
 }
 
 const char * llama_quantum_random_last_text() {
-    return llama_quantum_random_last_text_storage.empty() ? nullptr : llama_quantum_random_last_text_storage.c_str();
+    return llama_quantum_random_last_text_ptr;
 }
 
 static double llama_quantum_random_value_at(llama_quantum_random_state & state, size_t index) {
     llama_quantum_random_last_index = index;
     llama_quantum_random_last_index_valid = true;
-    llama_quantum_random_last_text_storage = state.csv.texts[index];
+    llama_quantum_random_last_text_ptr = state.csv.texts[index].c_str();
     return state.csv.values[index];
+}
+
+static void llama_quantum_random_ensure_loaded(llama_quantum_csv_state & state) {
+    if (state.loaded.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+    llama_quantum_random_load_locked(state);
 }
 
 double llama_quantum_random_01() {
     llama_quantum_random_state & state = llama_quantum_random_get_state();
     static std::atomic<size_t> fallback_index = 0;
 
-    {
-        std::lock_guard<std::mutex> lock(state.csv.mutex);
-        llama_quantum_random_load_locked(state.csv);
-    }
+    llama_quantum_random_ensure_loaded(state.csv);
 
 #ifdef _WIN32
     const bool use_qrng = !llama_quantum_qrng_disabled();
@@ -473,10 +479,7 @@ double llama_quantum_random_01() {
 double llama_quantum_random_next_01() {
     llama_quantum_random_state & state = llama_quantum_random_get_state();
 
-    {
-        std::lock_guard<std::mutex> lock(state.csv.mutex);
-        llama_quantum_random_load_locked(state.csv);
-    }
+    llama_quantum_random_ensure_loaded(state.csv);
 
     if (!llama_quantum_random_last_index_valid) {
         return llama_quantum_random_01();
