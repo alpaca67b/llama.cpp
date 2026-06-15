@@ -32,6 +32,10 @@ const char * llama_quantum_random_path() {
     return "C:\\Scripts\\qiskit\\full_export\\random_numbers_1920x1440.txt";
 }
 
+bool llama_quantum_qrng_disabled() {
+    return std::getenv("LLAMA_QUANTUM_QRNG_DISABLE") != nullptr;
+}
+
 struct llama_quantum_csv_state {
     std::mutex mutex;
     std::vector<double> values;
@@ -403,6 +407,10 @@ size_t llama_quantum_pick_index(llama_quantum_qrng_state & state, size_t n_value
 
 extern "C" LLAMA_API const char * llama_quantum_qrng_detect_port() {
 #ifdef _WIN32
+    if (llama_quantum_qrng_disabled()) {
+        return nullptr;
+    }
+
     llama_quantum_random_state & state = llama_quantum_random_get_state();
     std::lock_guard<std::mutex> lock(state.qrng.mutex);
     llama_quantum_qrng_detect_port_locked(state.qrng);
@@ -425,6 +433,7 @@ static double llama_quantum_random_value_at(llama_quantum_random_state & state, 
 
 double llama_quantum_random_01() {
     llama_quantum_random_state & state = llama_quantum_random_get_state();
+    static std::atomic<size_t> fallback_index = 0;
 
     {
         std::lock_guard<std::mutex> lock(state.csv.mutex);
@@ -432,24 +441,30 @@ double llama_quantum_random_01() {
     }
 
 #ifdef _WIN32
-    llama_quantum_qrng_start_if_needed(state.qrng);
+    const bool use_qrng = !llama_quantum_qrng_disabled();
 
-    const size_t index = llama_quantum_pick_index(state.qrng, state.csv.values.size());
+    if (use_qrng) {
+        llama_quantum_qrng_start_if_needed(state.qrng);
+    }
+
+    const size_t index = use_qrng
+        ? llama_quantum_pick_index(state.qrng, state.csv.values.size())
+        : fallback_index.fetch_add(1) % state.csv.values.size();
+
     const size_t consumed = ++state.total_consumed;
 
     if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
         const bool log_all = std::getenv("LLAMA_QUANTUM_RNG_LOG_ALL") != nullptr;
         if (log_all || consumed <= 64) {
             fprintf(stderr,
-                    "[quantum-rng] consumed=%zu random_index=%zu value=%s\n",
+                    "[quantum-rng] source=%s consumed=%zu random_index=%zu value=%s\n",
+                    use_qrng ? "qrng" : "txt",
                     consumed, index, state.csv.texts[index].c_str());
         }
     }
 
     return llama_quantum_random_value_at(state, index);
 #else
-    static std::atomic<size_t> fallback_index = 0;
-
     const size_t index = fallback_index.fetch_add(1) % state.csv.values.size();
     return llama_quantum_random_value_at(state, index);
 #endif
