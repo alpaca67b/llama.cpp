@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -48,6 +49,15 @@ thread_local size_t llama_quantum_random_last_index = 0;
 thread_local bool llama_quantum_random_last_index_valid = false;
 
 #ifdef _WIN32
+static constexpr size_t LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY        = 30000;
+static constexpr size_t LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_INITIAL  = 300;
+static constexpr size_t LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_FALLBACK = 200;
+static constexpr size_t LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_RETRY    = 150;
+static constexpr size_t LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_MIN      = 100;
+static constexpr size_t LLAMA_QUANTUM_QRNG_STARTUP_FILL           = 3000;
+static constexpr size_t LLAMA_QUANTUM_QRNG_LOW_WATERMARK          = 6000;
+static constexpr size_t LLAMA_QUANTUM_QRNG_TARGET_FILL            = 24000;
+
 struct llama_quantum_qrng_state {
     std::mutex mutex;
     std::condition_variable cv_sample;
@@ -55,10 +65,12 @@ struct llama_quantum_qrng_state {
     bool worker_started = false;
     bool stop_worker = false;
     bool init_failed = false;
-    bool have_sample = false;
-    uint8_t latest_bytes[3] = { 0, 0, 0 };
-    uint64_t sample_seq = 0;
-    uint64_t consumed_seq = 0;
+    std::array<uint32_t, LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY> samples = {};
+    uint64_t write_seq = 0;
+    uint64_t read_seq = 0;
+    bool read_seq_initialized = false;
+    size_t batch_samples = LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_INITIAL;
+    size_t startup_fill = LLAMA_QUANTUM_QRNG_STARTUP_FILL;
     bool port_detected = false;
     std::string port_name;
     std::string error_message;
@@ -68,12 +80,12 @@ void llama_quantum_qrng_reset_state(llama_quantum_qrng_state & state) {
     state.worker_started = false;
     state.stop_worker = false;
     state.init_failed = false;
-    state.have_sample = false;
-    state.latest_bytes[0] = 0;
-    state.latest_bytes[1] = 0;
-    state.latest_bytes[2] = 0;
-    state.sample_seq = 0;
-    state.consumed_seq = 0;
+    state.samples.fill(0);
+    state.write_seq = 0;
+    state.read_seq = 0;
+    state.read_seq_initialized = false;
+    state.batch_samples = LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_INITIAL;
+    state.startup_fill = LLAMA_QUANTUM_QRNG_STARTUP_FILL;
     state.port_detected = false;
     state.port_name.clear();
     state.error_message.clear();
@@ -256,6 +268,43 @@ std::string llama_quantum_qrng_detect_port_locked(llama_quantum_qrng_state & sta
     return "";
 }
 
+uint64_t llama_quantum_qrng_oldest_seq_locked(const llama_quantum_qrng_state & state) {
+    return state.write_seq > LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY
+        ? state.write_seq - LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY
+        : 0;
+}
+
+size_t llama_quantum_qrng_available_locked(const llama_quantum_qrng_state & state) {
+    return (size_t) (state.write_seq - llama_quantum_qrng_oldest_seq_locked(state));
+}
+
+size_t llama_quantum_qrng_desired_fill_locked(const llama_quantum_qrng_state & state) {
+    return state.read_seq_initialized ? LLAMA_QUANTUM_QRNG_TARGET_FILL : state.startup_fill;
+}
+
+size_t llama_quantum_qrng_next_batch_samples(size_t current_batch_samples) {
+    if (current_batch_samples > LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_FALLBACK) {
+        return LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_FALLBACK;
+    }
+
+    if (current_batch_samples > LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_RETRY) {
+        return LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_RETRY;
+    }
+
+    if (current_batch_samples > LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_MIN) {
+        return LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_MIN;
+    }
+
+    return current_batch_samples;
+}
+
+uint32_t llama_quantum_qrng_pack_u24(const uint8_t * bytes) {
+    return
+        (uint32_t) bytes[0] |
+        ((uint32_t) bytes[1] << 8) |
+        ((uint32_t) bytes[2] << 16);
+}
+
 void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
     std::string port;
     {
@@ -313,38 +362,81 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
         return;
     }
 
+    std::array<uint8_t, LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_INITIAL * 3> batch_bytes = {};
+    std::array<uint32_t, LLAMA_QUANTUM_QRNG_BATCH_SAMPLES_INITIAL> batch_values = {};
+
     for (;;) {
-        uint8_t bytes[3] = { 0, 0, 0 };
-        const int read_ret = qcc_read_continuous(&qcc, bytes, 3);
+        size_t batch_samples = 0;
+
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv_sample.wait(lock, [&]() {
+                return state->stop_worker || state->init_failed || llama_quantum_qrng_available_locked(*state) < llama_quantum_qrng_desired_fill_locked(*state);
+            });
+
+            if (state->stop_worker || state->init_failed) {
+                break;
+            }
+
+            batch_samples = state->batch_samples;
+        }
+
+        const int read_ret = qcc_read_continuous(&qcc, batch_bytes.data(), (int) (batch_samples * 3));
 
         if (read_ret != QCC_OK) {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            if (!state->stop_worker) {
-                state->init_failed = true;
-                state->error_message = "qcc_read_continuous(3 bytes) failed with code " + std::to_string(read_ret);
+            bool retry_with_smaller_batch = false;
+            size_t next_batch_samples = batch_samples;
+
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->stop_worker) {
+                    next_batch_samples = llama_quantum_qrng_next_batch_samples(state->batch_samples);
+
+                    if (next_batch_samples < state->batch_samples) {
+                        state->batch_samples = next_batch_samples;
+                        state->startup_fill = (std::min)(state->startup_fill, state->batch_samples);
+                        state->error_message.clear();
+                        retry_with_smaller_batch = true;
+                    } else {
+                        state->init_failed = true;
+                        state->error_message = "qcc_read_continuous(" + std::to_string(batch_samples * 3) + " bytes) failed with code " + std::to_string(read_ret);
+                    }
+                }
             }
+
             state->cv_sample.notify_all();
+
+            if (retry_with_smaller_batch) {
+                if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
+                    fprintf(stderr,
+                            "[quantum-rng] qcc_read_continuous(%zu bytes) failed with code %d, reducing batch to %zu samples\n",
+                            batch_samples * 3, read_ret, next_batch_samples);
+                }
+                continue;
+            }
+
             break;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            state->latest_bytes[0] = bytes[0];
-            state->latest_bytes[1] = bytes[1];
-            state->latest_bytes[2] = bytes[2];
-            state->have_sample = true;
-            state->error_message.clear();
-            ++state->sample_seq;
+        for (size_t i = 0; i < batch_samples; ++i) {
+            batch_values[i] = llama_quantum_qrng_pack_u24(batch_bytes.data() + i*3);
         }
-
-        state->cv_sample.notify_all();
 
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (state->stop_worker) {
                 break;
             }
+
+            for (size_t i = 0; i < batch_samples; ++i) {
+                state->samples[(size_t) (state->write_seq % LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY)] = batch_values[i];
+                ++state->write_seq;
+            }
+
+            state->error_message.clear();
         }
+
+        state->cv_sample.notify_all();
     }
 
     qcc_cmd_stop(&qcc);
@@ -365,30 +457,41 @@ void llama_quantum_qrng_start_if_needed(llama_quantum_qrng_state & state) {
 uint32_t llama_quantum_qrng_next_u32(llama_quantum_qrng_state & state) {
     std::unique_lock<std::mutex> lock(state.mutex);
 
-    if (state.init_failed) {
-        throw std::runtime_error(state.error_message);
+    for (;;) {
+        if (state.init_failed) {
+            throw std::runtime_error(state.error_message);
+        }
+
+        if (state.stop_worker) {
+            throw std::runtime_error("QRNG worker stopped");
+        }
+
+        const uint64_t oldest_seq = llama_quantum_qrng_oldest_seq_locked(state);
+        const uint64_t newest_seq = state.write_seq;
+        const size_t available = (size_t) (newest_seq - oldest_seq);
+
+        if (!state.read_seq_initialized) {
+            if (available >= state.startup_fill && available > 0) {
+                state.read_seq = oldest_seq;
+                state.read_seq_initialized = true;
+            }
+        } else if (state.read_seq < oldest_seq) {
+            state.read_seq = oldest_seq;
+        }
+
+        if (state.read_seq_initialized && state.read_seq < newest_seq) {
+            const uint32_t value = state.samples[(size_t) (state.read_seq % LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY)];
+            ++state.read_seq;
+
+            if ((size_t) (newest_seq - state.read_seq) <= LLAMA_QUANTUM_QRNG_LOW_WATERMARK) {
+                state.cv_sample.notify_all();
+            }
+
+            return value;
+        }
+
+        state.cv_sample.wait(lock);
     }
-
-    state.cv_sample.wait(lock, [&]() {
-        return state.stop_worker || state.init_failed || (state.have_sample && state.sample_seq != state.consumed_seq);
-    });
-
-    if (state.init_failed) {
-        throw std::runtime_error(state.error_message);
-    }
-
-    if (state.stop_worker) {
-        throw std::runtime_error("QRNG worker stopped");
-    }
-
-    const uint32_t value =
-        (uint32_t) state.latest_bytes[0] |
-        ((uint32_t) state.latest_bytes[1] << 8) |
-        ((uint32_t) state.latest_bytes[2] << 16);
-
-    state.consumed_seq = state.sample_seq;
-
-    return value;
 }
 
 size_t llama_quantum_pick_index(llama_quantum_qrng_state & state, size_t n_values) {
