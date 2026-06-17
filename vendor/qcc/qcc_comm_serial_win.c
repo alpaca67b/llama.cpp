@@ -120,16 +120,16 @@ int serial_init(qcc_comm_dev *dev, char *dev_id) {
 
 int serial_write(qcc_comm_dev dev, char *buf, int len) {
   serial_hdl *hdl = dev;
-   QCC_DEBUG_PRINT("[SERIAL] Write, len = %d\n", len);
- // WORD written = 0;
-  BOOL success = WriteFile(hdl->handle, buf, len, 0, NULL);
+  DWORD written = 0;
+  QCC_DEBUG_PRINT("[SERIAL] Write, len = %d\n", len);
+  BOOL success = WriteFile(hdl->handle, buf, len, &written, NULL);
   if (!success) {
     return QCC_ERROR;
   }
 
-  //if (written != len){
-  //  return QCC_ERROR;
-  //}
+  if (written != (DWORD) len) {
+    return QCC_ERROR;
+  }
   
   QCC_DEBUG_PRINT("[SERIAL] Written, handle = %d\n", hdl->handle);
   return (int)len;
@@ -172,6 +172,7 @@ int serial_flush_in(qcc_comm_dev dev){
   serial_hdl *hdl = dev;
   COMSTAT stat;
   char buffer[1];
+  DWORD received = 0;
   BOOL success = ClearCommError(hdl->handle, NULL, &stat);
   if (!success) {
     QCC_DEBUG_PRINT("[SERIAL] Flush , ClearCommError error\n");
@@ -179,9 +180,7 @@ int serial_flush_in(qcc_comm_dev dev){
   }
   QCC_DEBUG_PRINT("[SERIAL] Flush %d bytes \n", stat.cbInQue);
   for(int i = 0; i < stat.cbInQue; i++)
-    ReadFile(hdl->handle, buffer, 1, NULL, NULL);
+    ReadFile(hdl->handle, buffer, 1, &received, NULL);
 
   return QCC_OK;
 }
-
-

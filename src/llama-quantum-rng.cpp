@@ -8,6 +8,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cctype>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,11 +59,28 @@ static constexpr size_t LLAMA_QUANTUM_QRNG_STARTUP_FILL           = 3000;
 static constexpr size_t LLAMA_QUANTUM_QRNG_LOW_WATERMARK          = 6000;
 static constexpr size_t LLAMA_QUANTUM_QRNG_TARGET_FILL            = 24000;
 
+bool llama_quantum_qrng_io_log_enabled() {
+    return std::getenv("LLAMA_QUANTUM_QRNG_IO_LOG") != nullptr;
+}
+
+void llama_quantum_qrng_io_log(const char * fmt, ...) {
+    if (!llama_quantum_qrng_io_log_enabled()) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "[quantum-qrng-io] ");
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
 struct llama_quantum_qrng_state {
     std::mutex mutex;
     std::condition_variable cv_sample;
     std::thread worker;
     bool worker_started = false;
+    bool worker_already_started_logged = false;
     bool stop_worker = false;
     bool init_failed = false;
     std::array<uint32_t, LLAMA_QUANTUM_QRNG_SAMPLE_CAPACITY> samples = {};
@@ -78,6 +96,7 @@ struct llama_quantum_qrng_state {
 
 void llama_quantum_qrng_reset_state(llama_quantum_qrng_state & state) {
     state.worker_started = false;
+    state.worker_already_started_logged = false;
     state.stop_worker = false;
     state.init_failed = false;
     state.samples.fill(0);
@@ -92,6 +111,10 @@ void llama_quantum_qrng_reset_state(llama_quantum_qrng_state & state) {
 }
 
 void llama_quantum_qrng_shutdown_impl(llama_quantum_qrng_state & state) {
+    llama_quantum_qrng_io_log("shutdown requested worker_started=%d stop_worker=%d\n",
+            state.worker_started ? 1 : 0,
+            state.stop_worker ? 1 : 0);
+
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.stop_worker = true;
@@ -100,6 +123,7 @@ void llama_quantum_qrng_shutdown_impl(llama_quantum_qrng_state & state) {
     state.cv_sample.notify_all();
 
     if (state.worker_started && state.worker.joinable()) {
+        llama_quantum_qrng_io_log("joining worker thread\n");
         state.worker.join();
     }
 
@@ -108,21 +132,27 @@ void llama_quantum_qrng_shutdown_impl(llama_quantum_qrng_state & state) {
         state.worker = std::thread();
         llama_quantum_qrng_reset_state(state);
     }
+
+    llama_quantum_qrng_io_log("shutdown complete\n");
 }
 
 bool llama_quantum_qrng_prepare_command_mode(qcc_hdl_t & qcc) {
     cmdctrl_status_t status = {};
     int status_ret = qcc_cmd_get_status(&qcc, &status);
+    llama_quantum_qrng_io_log("qcc_cmd_get_status ret=%d\n", status_ret);
 
     if (status_ret == QCC_OK) {
         return true;
     }
 
-    if (qcc_cmd_stop(&qcc) != QCC_OK) {
+    const int stop_ret = qcc_cmd_stop(&qcc);
+    llama_quantum_qrng_io_log("qcc_cmd_stop ret=%d after status failure\n", stop_ret);
+    if (stop_ret != QCC_OK) {
         return false;
     }
 
     status_ret = qcc_cmd_get_status(&qcc, &status);
+    llama_quantum_qrng_io_log("qcc_cmd_get_status retry ret=%d\n", status_ret);
     return status_ret == QCC_OK;
 }
 #endif
@@ -245,26 +275,36 @@ std::vector<std::string> llama_quantum_qrng_candidate_ports() {
 
 std::string llama_quantum_qrng_detect_port_locked(llama_quantum_qrng_state & state) {
     if (state.port_detected) {
+        llama_quantum_qrng_io_log("using cached port=%s\n", state.port_name.c_str());
         return state.port_name;
     }
 
-    for (const std::string & port : llama_quantum_qrng_candidate_ports()) {
+    const std::vector<std::string> ports = llama_quantum_qrng_candidate_ports();
+    llama_quantum_qrng_io_log("detected %zu candidate COM ports\n", ports.size());
+
+    for (const std::string & port : ports) {
         qcc_hdl_t qcc = {};
+        llama_quantum_qrng_io_log("probing port=%s qcc_init(timeout_ms=500 read_size=1760)\n", port.c_str());
         const int init_ret = qcc_init(&qcc, QCC_SERIAL, const_cast<char *>(port.c_str()), 500, 1760);
+        llama_quantum_qrng_io_log("probe port=%s qcc_init ret=%d\n", port.c_str(), init_ret);
         if (init_ret != QCC_OK) {
             continue;
         }
 
         const bool status_ok = llama_quantum_qrng_prepare_command_mode(qcc);
+        llama_quantum_qrng_io_log("probe port=%s prepare_command_mode=%s\n", port.c_str(), status_ok ? "ok" : "fail");
+        llama_quantum_qrng_io_log("probe port=%s qcc_close\n", port.c_str());
         qcc_close(&qcc);
 
         if (status_ok) {
             state.port_name = port;
             state.port_detected = true;
+            llama_quantum_qrng_io_log("selected port=%s\n", state.port_name.c_str());
             return state.port_name;
         }
     }
 
+    llama_quantum_qrng_io_log("no usable QRNG COM port detected\n");
     return "";
 }
 
@@ -306,6 +346,8 @@ uint32_t llama_quantum_qrng_pack_u24(const uint8_t * bytes) {
 }
 
 void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
+    llama_quantum_qrng_io_log("worker thread started\n");
+
     std::string port;
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -319,12 +361,15 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             state->error_message = "failed to detect QRNG COM port";
         }
 
+        llama_quantum_qrng_io_log("worker failed to detect QRNG COM port\n");
         state->cv_sample.notify_all();
         return;
     }
 
     qcc_hdl_t qcc = {};
+    llama_quantum_qrng_io_log("opening port=%s qcc_init(timeout_ms=500 read_size=1760)\n", port.c_str());
     const int ret = qcc_init(&qcc, QCC_SERIAL, const_cast<char *>(port.c_str()), 500, 1760);
+    llama_quantum_qrng_io_log("worker port=%s qcc_init ret=%d\n", port.c_str(), ret);
 
     if (ret != QCC_OK) {
         {
@@ -333,10 +378,12 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             state->error_message = "qcc_init(" + port + ") failed with code " + std::to_string(ret);
         }
 
+        llama_quantum_qrng_io_log("worker init failed port=%s ret=%d\n", port.c_str(), ret);
         state->cv_sample.notify_all();
         return;
     }
 
+    llama_quantum_qrng_io_log("worker port=%s prepare_command_mode\n", port.c_str());
     if (!llama_quantum_qrng_prepare_command_mode(qcc)) {
         {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -344,12 +391,16 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             state->error_message = "failed to stop stale QRNG continuous mode on " + port;
         }
 
+        llama_quantum_qrng_io_log("worker port=%s prepare_command_mode failed\n", port.c_str());
         state->cv_sample.notify_all();
+        llama_quantum_qrng_io_log("worker port=%s qcc_close\n", port.c_str());
         qcc_close(&qcc);
         return;
     }
 
+    llama_quantum_qrng_io_log("worker port=%s qcc_cmd_start(mode=continuous)\n", port.c_str());
     const int start_ret = qcc_cmd_start(&qcc, CMDCTRL_START_CONTINUOUS, NULL, 0);
+    llama_quantum_qrng_io_log("worker port=%s qcc_cmd_start ret=%d\n", port.c_str(), start_ret);
     if (start_ret != QCC_OK) {
         {
             std::lock_guard<std::mutex> lock(state->mutex);
@@ -357,7 +408,9 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             state->error_message = "qcc_cmd_start(continuous) failed with code " + std::to_string(start_ret);
         }
 
+        llama_quantum_qrng_io_log("worker port=%s continuous start failed ret=%d\n", port.c_str(), start_ret);
         state->cv_sample.notify_all();
+        llama_quantum_qrng_io_log("worker port=%s qcc_close\n", port.c_str());
         qcc_close(&qcc);
         return;
     }
@@ -367,6 +420,8 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
 
     for (;;) {
         size_t batch_samples = 0;
+        size_t available_before = 0;
+        size_t desired_fill = 0;
 
         {
             std::unique_lock<std::mutex> lock(state->mutex);
@@ -378,10 +433,21 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
                 break;
             }
 
+            available_before = llama_quantum_qrng_available_locked(*state);
+            desired_fill = llama_quantum_qrng_desired_fill_locked(*state);
             batch_samples = state->batch_samples;
         }
 
+        llama_quantum_qrng_io_log("fill request port=%s available=%zu desired=%zu batch_samples=%zu bytes=%zu\n",
+                port.c_str(),
+                available_before,
+                desired_fill,
+                batch_samples,
+                batch_samples * 3);
+
+        llama_quantum_qrng_io_log("qcc_read_continuous port=%s bytes=%zu\n", port.c_str(), batch_samples * 3);
         const int read_ret = qcc_read_continuous(&qcc, batch_bytes.data(), (int) (batch_samples * 3));
+        llama_quantum_qrng_io_log("qcc_read_continuous port=%s ret=%d\n", port.c_str(), read_ret);
 
         if (read_ret != QCC_OK) {
             bool retry_with_smaller_batch = false;
@@ -407,6 +473,11 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             state->cv_sample.notify_all();
 
             if (retry_with_smaller_batch) {
+                llama_quantum_qrng_io_log("fill retry port=%s failed_bytes=%zu ret=%d next_batch_samples=%zu\n",
+                        port.c_str(),
+                        batch_samples * 3,
+                        read_ret,
+                        next_batch_samples);
                 if (std::getenv("LLAMA_QUANTUM_RNG_LOG")) {
                     fprintf(stderr,
                             "[quantum-rng] qcc_read_continuous(%zu bytes) failed with code %d, reducing batch to %zu samples\n",
@@ -415,6 +486,10 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
                 continue;
             }
 
+            llama_quantum_qrng_io_log("fill failed port=%s failed_bytes=%zu ret=%d\n",
+                    port.c_str(),
+                    batch_samples * 3,
+                    read_ret);
             break;
         }
 
@@ -434,24 +509,41 @@ void llama_quantum_qrng_worker(llama_quantum_qrng_state * state) {
             }
 
             state->error_message.clear();
+
+            llama_quantum_qrng_io_log("fill committed port=%s samples=%zu available_before=%zu available_after=%zu write_seq=%llu read_seq=%llu\n",
+                    port.c_str(),
+                    batch_samples,
+                    available_before,
+                    llama_quantum_qrng_available_locked(*state),
+                    (unsigned long long) state->write_seq,
+                    (unsigned long long) state->read_seq);
         }
 
         state->cv_sample.notify_all();
     }
 
+    llama_quantum_qrng_io_log("worker port=%s qcc_cmd_stop\n", port.c_str());
     qcc_cmd_stop(&qcc);
+    llama_quantum_qrng_io_log("worker port=%s qcc_close\n", port.c_str());
     qcc_close(&qcc);
+    llama_quantum_qrng_io_log("worker thread exiting port=%s\n", port.c_str());
 }
 
 void llama_quantum_qrng_start_if_needed(llama_quantum_qrng_state & state) {
     std::lock_guard<std::mutex> lock(state.mutex);
 
     if (state.worker_started) {
+        if (!state.worker_already_started_logged) {
+            llama_quantum_qrng_io_log("worker already started\n");
+            state.worker_already_started_logged = true;
+        }
         return;
     }
 
+    llama_quantum_qrng_io_log("starting worker thread\n");
     state.worker = std::thread(llama_quantum_qrng_worker, &state);
     state.worker_started = true;
+    state.worker_already_started_logged = false;
 }
 
 uint32_t llama_quantum_qrng_next_u32(llama_quantum_qrng_state & state) {
