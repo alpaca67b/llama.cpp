@@ -31,7 +31,7 @@ extern "C" {
 namespace {
 
 const char * llama_quantum_random_path() {
-    return "C:\\Scripts\\qiskit\\full_export\\random_numbers_1920x1440.txt";
+    return "C:\\Scripts\\llama.cpp\\resources\\random_numbers_1.txt";
 }
 
 bool llama_quantum_qrng_disabled() {
