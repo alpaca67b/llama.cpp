@@ -180,6 +180,8 @@ void llama_quantum_random_load_locked(llama_quantum_csv_state & state) {
         return;
     }
 
+    constexpr size_t max_txt_values = 65536;
+
     const char * path = llama_quantum_random_path();
     std::ifstream file(path);
     if (!file) {
@@ -187,10 +189,10 @@ void llama_quantum_random_load_locked(llama_quantum_csv_state & state) {
     }
 
     std::string line;
-    while (std::getline(file, line)) {
+    while (state.values.size() < max_txt_values && std::getline(file, line)) {
         size_t start = 0;
 
-        while (start < line.size()) {
+        while (state.values.size() < max_txt_values && start < line.size()) {
             size_t end = line.find(',', start);
             if (end == std::string::npos) {
                 end = line.size();
