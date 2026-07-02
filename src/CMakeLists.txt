@@ -53,17 +53,6 @@ target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
-if (WIN32)
-    target_sources(llama PRIVATE
-        ../vendor/qcc/qcc.c
-        ../vendor/qcc/qcc_comm_serial_win.c
-        ../vendor/qcc/qcc_comm_tcpudp_win.c)
-
-    target_include_directories(llama PRIVATE ../vendor/qcc)
-    target_compile_definitions(llama PRIVATE WINDOWS_OS QRNG_CMDCTRL_FULL_MODE)
-    target_link_libraries(llama PRIVATE wsock32 ws2_32 AdvApi32)
-endif()
-
 target_link_libraries(llama PUBLIC ggml)
 
 if (BUILD_SHARED_LIBS)
