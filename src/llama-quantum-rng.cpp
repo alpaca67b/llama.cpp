@@ -2,25 +2,26 @@
 #include "llama.h"
 
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <cstdlib>
-#include <cstdint>
 #include <cstdio>
 #include <fstream>
-#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
 
 const char * llama_quantum_random_path() {
-    return "C:\\Scripts\\llama.cpp\\resources\\random_bytes_1.bin";
+    return "C:\\Scripts\\llama.cpp\\resources\\random_numbers_final.txt";
 }
 
 struct llama_quantum_random_state {
     std::mutex mutex;
-    std::vector<uint16_t> values;
+    std::vector<double> values;
     std::vector<std::string> texts;
     std::atomic<bool> loaded = false;
     std::atomic<size_t> next_index = 0;
@@ -40,28 +41,48 @@ void llama_quantum_random_load_locked(llama_quantum_random_state & state) {
     }
 
     const char * path = llama_quantum_random_path();
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path);
     if (!file) {
         throw std::runtime_error(std::string("failed to open quantum random file: ") + path);
     }
 
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    const size_t pair_count = bytes.size() / 2;
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t start = 0;
 
-    if (pair_count == 0) {
-        throw std::runtime_error(std::string("quantum random file has no usable byte pairs: ") + path);
+        while (start < line.size()) {
+            size_t end = line.find(',', start);
+            if (end == std::string::npos) {
+                end = line.size();
+            }
+
+            std::string_view token(line.data() + start, end - start);
+
+            while (!token.empty() && std::isspace((unsigned char) token.front())) {
+                token.remove_prefix(1);
+            }
+
+            while (!token.empty() && std::isspace((unsigned char) token.back())) {
+                token.remove_suffix(1);
+            }
+
+            if (!token.empty()) {
+                const std::string token_text(token);
+                char * parse_end = nullptr;
+                const double value = std::strtod(token_text.c_str(), &parse_end);
+
+                if (parse_end != token_text.c_str() && *parse_end == '\0' && std::isfinite(value)) {
+                    state.values.push_back(value);
+                    state.texts.push_back(token_text);
+                }
+            }
+
+            start = end + 1;
+        }
     }
 
-    state.values.reserve(pair_count);
-    state.texts.reserve(pair_count);
-
-    for (size_t i = 0; i < pair_count; ++i) {
-        const uint16_t value =
-            ((uint16_t) bytes[2*i] << 8) |
-            (uint16_t) bytes[2*i + 1];
-
-        state.values.push_back(value);
-        state.texts.push_back(std::to_string((unsigned int) value));
+    if (state.values.empty()) {
+        throw std::runtime_error(std::string("quantum random file has no usable numbers: ") + path);
     }
 
     state.loaded.store(true, std::memory_order_release);
@@ -82,14 +103,14 @@ static void llama_quantum_random_ensure_loaded(llama_quantum_random_state & stat
 
 static double llama_quantum_random_value_at(llama_quantum_random_state & state, size_t index) {
     llama_quantum_random_last_text_ptr = state.texts[index].c_str();
-    return (double) state.values[index] / 65536.0;
+    return state.values[index];
 }
 
 } // namespace
 
 extern "C" LLAMA_API const char * llama_quantum_qrng_detect_port() {
     const char * path = llama_quantum_random_path();
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path);
     return file ? path : nullptr;
 }
 
@@ -109,7 +130,7 @@ double llama_quantum_random_01() {
         const bool log_all = std::getenv("LLAMA_QUANTUM_RNG_LOG_ALL") != nullptr;
         if (log_all || consumed <= 64) {
             fprintf(stderr,
-                    "[quantum-rng] source=virtual-bin consumed=%zu random_index=%zu value=%s\n",
+                    "[quantum-rng] source=txt consumed=%zu random_index=%zu value=%s\n",
                     consumed, index, state.texts[index].c_str());
         }
     }
